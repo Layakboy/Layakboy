@@ -1,5 +1,5 @@
 - 👋 Hi, I’m @Layakboy
-- 👀 I’m interested in Traveller
+- 👀 I’m interested in Travelling
 - 🌱 I’m currently learning Code
 - 💞️ I’m looking to collaborate on Trusted Team
 - 📫 How to reach me no one can reach me
