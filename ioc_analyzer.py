@@ -8,6 +8,12 @@ import threading
 from tqdm import tqdm
 import re
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import WebDriverException, TimeoutException
 
 # List of common VirusTotal vendors (can be expanded)
 COMMON_VT_VENDORS = sorted([
@@ -29,6 +35,9 @@ api_keys = [
     'cf651d39e830f9eb24817e9b4fda19c267dfa69106b847411602fbafc40d7d5d',
     '352bcd0eefc96877c5dc26b13a7449b1b85168fa307fe4c39dd394ac75450ab4',
 ]
+
+# Path to ChromeDriver executable for Selenium Talos lookups
+CHROMEDRIVER_PATH = "/path/to/chromedriver"
 
 
 class APIKeyManager:
@@ -294,12 +303,102 @@ def check_ioc_talos(ioc, ioc_type, delay=3):
         }
 
 
-def check_ioc_comprehensive(ioc, ioc_type, api_key_manager, selected_vendors=None, include_talos=True, delay=2):
+def check_ioc_talos_selenium(ioc, ioc_type, driver_path, timeout=10):
+    """Check IOC against Talos using Selenium to render JavaScript."""
+    base_url = "https://talosintelligence.com/"
+    if ioc_type in ["domain", "hostname", "ip"]:
+        lookup = ioc
+    elif ioc_type in ["FileHash-MD5", "FileHash-SHA1", "FileHash-SHA256"]:
+        lookup = ioc
+    elif ioc_type == "URL":
+        try:
+            from urllib.parse import urlparse
+
+            lookup = urlparse(ioc).netloc
+        except Exception:
+            lookup = ioc
+    else:
+        return {
+            "ioc": ioc,
+            "talos_verdict": "Unsupported Type",
+            "talos_category": "Unknown",
+            "talos_confidence": "N/A",
+        }
+
+    url = f"{base_url}reputation_center/lookup?search={lookup}"
+
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+
+    driver = None
+    try:
+        driver = webdriver.Chrome(executable_path=driver_path, options=chrome_options)
+        driver.set_page_load_timeout(timeout)
+        tqdm.write(f"Checking Talos (Selenium) for {ioc_type}: {ioc}")
+        driver.get(url)
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".reputation-score"))
+        )
+        time.sleep(1)
+        page_source = driver.page_source
+    except (WebDriverException, TimeoutException) as e:
+        return {
+            "ioc": ioc,
+            "talos_verdict": f"Error: {str(e)}",
+            "talos_category": "Error",
+            "talos_confidence": "N/A",
+        }
+    finally:
+        if driver:
+            driver.quit()
+
+    soup = BeautifulSoup(page_source, "html.parser")
+    verdict = "Unknown"
+    category = "Unknown"
+    confidence = "Low"
+
+    verdict_elem = soup.find("div", class_="well-reputation") or soup.find(
+        "div", class_="reputation-score"
+    )
+    if verdict_elem:
+        verdict = verdict_elem.get_text(strip=True)
+
+    text_content = soup.get_text()
+    cat_match = re.search(r"Category\s*:\s*(Benign|Suspicious|Malicious)", text_content, re.I)
+    if cat_match:
+        category = cat_match.group(1).title()
+
+    conf_match = re.search(r"Confidence\s*:\s*(High|Medium|Low)", text_content, re.I)
+    if conf_match:
+        confidence = conf_match.group(1).title()
+
+    return {
+        "ioc": ioc,
+        "talos_verdict": verdict,
+        "talos_category": category,
+        "talos_confidence": confidence,
+    }
+
+
+def check_ioc_comprehensive(
+    ioc,
+    ioc_type,
+    api_key_manager,
+    selected_vendors=None,
+    include_talos=True,
+    driver_path=None,
+    timeout=10,
+    delay=2,
+):
     """Check IOC against both VirusTotal and Talos."""
-    vt_result = check_ioc_virustotal(ioc, ioc_type, api_key_manager, selected_vendors, delay)
+    vt_result = check_ioc_virustotal(
+        ioc, ioc_type, api_key_manager, selected_vendors, delay
+    )
     talos_result = {}
-    if include_talos:
-        talos_result = check_ioc_talos(ioc, ioc_type, delay)
+    if include_talos and driver_path:
+        talos_result = check_ioc_talos_selenium(ioc, ioc_type, driver_path, timeout)
 
     combined = vt_result.copy()
     if include_talos and talos_result:
@@ -569,13 +668,20 @@ def get_filename(app_names_list):
     return "Unknown"
 
 
-def process_iocs_concurrently(iocs, api_keys, selected_vendors=None, include_talos=True):
+def process_iocs_concurrently(
+    iocs,
+    api_keys,
+    selected_vendors=None,
+    include_talos=True,
+    driver_path=None,
+    timeout=10,
+):
     """Process IOCs concurrently using VirusTotal and Talos."""
     results = []
     unique_iocs_count = sum(len(ioc_list) for ioc_list in iocs.values())
     api_key_manager = APIKeyManager(api_keys)
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         future_to_ioc = {}
         for ioc_type, ioc_list in iocs.items():
             for ioc in ioc_list:
@@ -586,6 +692,8 @@ def process_iocs_concurrently(iocs, api_keys, selected_vendors=None, include_tal
                     api_key_manager,
                     selected_vendors,
                     include_talos,
+                    driver_path,
+                    timeout,
                 )
                 future_to_ioc[future] = (ioc, ioc_type)
 
@@ -743,7 +851,11 @@ def main():
         return
 
     results = process_iocs_concurrently(
-        iocs, api_keys, selected_vendors=COMMON_VT_VENDORS, include_talos=True
+        iocs,
+        api_keys,
+        selected_vendors=COMMON_VT_VENDORS,
+        include_talos=True,
+        driver_path=CHROMEDRIVER_PATH,
     )
     saved_file = output_to_excel(results, output_file, total_read, duplicates_skipped)
     print(f"Results saved to {saved_file}")
