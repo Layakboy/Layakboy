@@ -8,6 +8,8 @@ import threading
 from tqdm import tqdm
 import re
 from bs4 import BeautifulSoup
+import json
+import os
 
 # List of common VirusTotal vendors (can be expanded)
 COMMON_VT_VENDORS = sorted([
@@ -197,7 +199,35 @@ def standardize_software_name(names, file_hash, vendors_results):
     return {"standard_name": "Unknown", "confidence": "Low", "classification": "Unknown"}
 
 
-def check_ioc_talos(ioc, ioc_type, delay=3):
+def create_talos_session(config_path=None):
+    """Create a requests session for Talos with optional config."""
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://talosintelligence.com/",
+        }
+    )
+
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+            cookies = cfg.get("cookies", {})
+            headers = cfg.get("headers", {})
+            if isinstance(cookies, dict):
+                session.cookies.update(cookies)
+            if isinstance(headers, dict):
+                session.headers.update(headers)
+        except Exception as e:
+            print(f"Error loading Talos config {config_path}: {e}")
+
+    return session
+
+
+def check_ioc_talos(ioc, ioc_type, session=None, delay=3):
     """Check IOC against Talos Intelligence."""
     base_url = "https://talosintelligence.com/"
     if ioc_type in ['domain', 'hostname']:
@@ -223,14 +253,17 @@ def check_ioc_talos(ioc, ioc_type, delay=3):
             "talos_confidence": "N/A",
         }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
+    if session is None:
+        session = create_talos_session()
+
+    headers = session.headers.copy()
+    headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+    headers.setdefault("Referer", "https://talosintelligence.com/")
 
     try:
         time.sleep(delay)
         tqdm.write(f"Checking Talos for {ioc_type}: {ioc}")
-        response = requests.get(url, headers=headers, timeout=10)
+        response = session.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
             return {
                 "ioc": ioc,
@@ -294,12 +327,20 @@ def check_ioc_talos(ioc, ioc_type, delay=3):
         }
 
 
-def check_ioc_comprehensive(ioc, ioc_type, api_key_manager, selected_vendors=None, include_talos=True, delay=2):
+def check_ioc_comprehensive(
+    ioc,
+    ioc_type,
+    api_key_manager,
+    selected_vendors=None,
+    include_talos=True,
+    delay=2,
+    session=None,
+):
     """Check IOC against both VirusTotal and Talos."""
     vt_result = check_ioc_virustotal(ioc, ioc_type, api_key_manager, selected_vendors, delay)
     talos_result = {}
     if include_talos:
-        talos_result = check_ioc_talos(ioc, ioc_type, delay)
+        talos_result = check_ioc_talos(ioc, ioc_type, session=session, delay=delay)
 
     combined = vt_result.copy()
     if include_talos and talos_result:
@@ -569,11 +610,19 @@ def get_filename(app_names_list):
     return "Unknown"
 
 
-def process_iocs_concurrently(iocs, api_keys, selected_vendors=None, include_talos=True):
+def process_iocs_concurrently(
+    iocs,
+    api_keys,
+    selected_vendors=None,
+    include_talos=True,
+    talos_config=None,
+):
     """Process IOCs concurrently using VirusTotal and Talos."""
     results = []
     unique_iocs_count = sum(len(ioc_list) for ioc_list in iocs.values())
     api_key_manager = APIKeyManager(api_keys)
+
+    talos_session = create_talos_session(talos_config) if include_talos else None
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_ioc = {}
@@ -586,6 +635,8 @@ def process_iocs_concurrently(iocs, api_keys, selected_vendors=None, include_tal
                     api_key_manager,
                     selected_vendors,
                     include_talos,
+                    2,
+                    talos_session,
                 )
                 future_to_ioc[future] = (ioc, ioc_type)
 
@@ -737,13 +788,23 @@ def main():
         print("No output file selected.")
         return
 
+    talos_config_path = filedialog.askopenfilename(
+        title="Talos Config (optional)", filetypes=[("JSON", "*.json"), ("All files", "*")]
+    )
+    if talos_config_path == "":
+        talos_config_path = None
+
     iocs, total_read, duplicates_skipped = extract_iocs_from_excel(input_file)
     if not iocs:
         print("No IOCs extracted.")
         return
 
     results = process_iocs_concurrently(
-        iocs, api_keys, selected_vendors=COMMON_VT_VENDORS, include_talos=True
+        iocs,
+        api_keys,
+        selected_vendors=COMMON_VT_VENDORS,
+        include_talos=True,
+        talos_config=talos_config_path,
     )
     saved_file = output_to_excel(results, output_file, total_read, duplicates_skipped)
     print(f"Results saved to {saved_file}")
